@@ -33,7 +33,7 @@
 #include <sodium.h>
 #include <arpa/inet.h>
 
-#include "cache.h"
+#include "ppbloom.h"
 #include "aead.h"
 #include "utils.h"
 
@@ -56,89 +56,50 @@
 #define CHUNK_SIZE_MASK         0x3FFF
 
 /*
- * This is SIP004 proposed by @Mygod, the design of TCP chunk is from @breakwa11 and
- * @Noisyfox. This first version of this file is written by @wongsyrone.
+ * Spec: http://shadowsocks.org/en/spec/AEAD-Ciphers.html
  *
- * The first nonce is either from client or server side, it is generated randomly, and
- * the sequent nonces are increased by 1.
+ * The way Shadowsocks using AEAD ciphers is specified in SIP004 and amended in SIP007. SIP004 was proposed by @Mygod
+ * with design inspirations from @wongsyrone, @Noisyfox and @breakwa11. SIP007 was proposed by @riobard with input from
+ * @madeye, @Mygod, @wongsyrone, and many others.
  *
- * Data.Len is used to separate general ciphertext and Auth tag. We can start decryption
- * if and only if the verification is passed.
- * Firstly, we do length check, then decrypt it, separate ciphertext and attached data tag
- * based on the verified length, verify data tag and decrypt the corresponding data.
- * Finally, do what you supposed to do, e.g. forward user data.
+ * Key Derivation
  *
- * For UDP, nonces are generated randomly without the incrementation.
+ * HKDF_SHA1 is a function that takes a secret key, a non-secret salt, an info string, and produces a subkey that is
+ * cryptographically strong even if the input secret key is weak.
  *
- * TCP request (before encryption)
- * +------+---------------------+------------------+
- * | ATYP | Destination Address | Destination Port |
- * +------+---------------------+------------------+
- * |  1   |       Variable      |         2        |
- * +------+---------------------+------------------+
+ *      HKDF_SHA1(key, salt, info) => subkey
  *
- * TCP request (after encryption, *ciphertext*)
- * +--------+--------------+------------------+--------------+---------------+
- * | NONCE  |  *HeaderLen* |   HeaderLen_TAG  |   *Header*   |  Header_TAG   |
- * +--------+--------------+------------------+--------------+---------------+
- * | Fixed  |       2      |       Fixed      |   Variable   |     Fixed     |
- * +--------+--------------+------------------+--------------+---------------+
+ * The info string binds the generated subkey to a specific application context. In our case, it must be the string
+ * "ss-subkey" without quotes.
  *
- * Header input: atyp + dst.addr + dst.port
- * HeaderLen is length(atyp + dst.addr + dst.port)
- * HeaderLen_TAG and Header_TAG are in plaintext
+ * We derive a per-session subkey from a pre-shared master key using HKDF_SHA1. Salt must be unique through the entire
+ * life of the pre-shared master key.
  *
- * TCP Chunk (before encryption)
- * +----------+
- * |  DATA    |
- * +----------+
- * | Variable |
- * +----------+
+ * TCP
  *
- * Data.Len is a 16-bit big-endian integer indicating the length of DATA.
+ * An AEAD encrypted TCP stream starts with a randomly generated salt to derive the per-session subkey, followed by any
+ * number of encrypted chunks. Each chunk has the following structure:
  *
- * TCP Chunk (after encryption, *ciphertext*)
- * +--------------+---------------+--------------+------------+
- * |  *DataLen*   |  DataLen_TAG  |    *Data*    |  Data_TAG  |
- * +--------------+---------------+--------------+------------+
- * |      2       |     Fixed     |   Variable   |   Fixed    |
- * +--------------+---------------+--------------+------------+
+ *      [encrypted payload length][length tag][encrypted payload][payload tag]
  *
- * Len_TAG and DATA_TAG have the same length, they are in plaintext.
- * After encryption, DATA -> DATA*
+ * Payload length is a 2-byte big-endian unsigned integer capped at 0x3FFF. The higher two bits are reserved and must be
+ * set to zero. Payload is therefore limited to 16*1024 - 1 bytes.
  *
- * UDP (before encryption)
- * +------+---------------------+------------------+----------+
- * | ATYP | Destination Address | Destination Port |   DATA   |
- * +------+---------------------+------------------+----------+
- * |  1   |       Variable      |         2        | Variable |
- * +------+---------------------+------------------+----------+
+ * The first AEAD encrypt/decrypt operation uses a counting nonce starting from 0. After each encrypt/decrypt operation,
+ * the nonce is incremented by one as if it were an unsigned little-endian integer. Note that each TCP chunk involves
+ * two AEAD encrypt/decrypt operation: one for the payload length, and one for the payload. Therefore each chunk
+ * increases the nonce twice.
  *
- * UDP (after encryption, *ciphertext*)
- * +--------+-----------+-----------+
- * | NONCE  |  *Data*   |  Data_TAG |
- * +--------+-----------+-----------+
- * | Fixed  | Variable  |   Fixed   |
- * +--------+-----------+-----------+
+ * UDP
  *
- * *Data* is Encrypt(atyp + dst.addr + dst.port + payload)
- * RSV and FRAG are dropped
- * Since UDP packet is either received completely or missed,
- * we don't have to keep a field to track its length.
+ * An AEAD encrypted UDP packet has the following structure:
+ *
+ *      [salt][encrypted payload][tag]
+ *
+ * The salt is used to derive the per-session subkey and must be generated randomly to ensure uniqueness. Each UDP
+ * packet is encrypted/decrypted independently, using the derived subkey and a nonce with all zero bytes.
  *
  */
-
-#ifdef DEBUG
-static void
-dump(char *tag, char *text, int len)
-{
-    int i;
-    printf("%s: ", tag);
-    for (i = 0; i < len; i++)
-        printf("0x%02x ", (uint8_t)text[i]);
-    printf("\n");
-}
-#endif
 
 const char *supported_aead_ciphers[AEAD_CIPHER_NUM] = {
     "aes-128-gcm",
@@ -185,7 +146,7 @@ static const int supported_aead_ciphers_tag_size[AEAD_CIPHER_NUM] = {
 };
 
 static int
-cipher_aead_encrypt(cipher_ctx_t *cipher_ctx,
+aead_cipher_encrypt(cipher_ctx_t *cipher_ctx,
                     uint8_t *c,
                     size_t *clen,
                     uint8_t *m,
@@ -193,12 +154,13 @@ cipher_aead_encrypt(cipher_ctx_t *cipher_ctx,
                     uint8_t *ad,
                     size_t adlen,
                     uint8_t *n,
-                    uint8_t *k,
-                    size_t nlen,
-                    size_t tlen)
+                    uint8_t *k)
 {
     int err                      = CRYPTO_OK;
     unsigned long long long_clen = 0;
+
+    size_t nlen = cipher_ctx->cipher->nonce_len;
+    size_t tlen = cipher_ctx->cipher->tag_len;
 
     switch (cipher_ctx->cipher->method) {
     case AES128GCM:
@@ -228,20 +190,17 @@ cipher_aead_encrypt(cipher_ctx_t *cipher_ctx,
 }
 
 static int
-cipher_aead_decrypt(cipher_ctx_t *cipher_ctx,
-                    uint8_t *p,
-                    size_t *plen,
-                    uint8_t *m,
-                    size_t mlen,
-                    uint8_t *ad,
-                    size_t adlen,
-                    uint8_t *n,
-                    uint8_t *k,
-                    size_t nlen,
-                    size_t tlen)
+aead_cipher_decrypt(cipher_ctx_t *cipher_ctx,
+                    uint8_t *p, size_t *plen,
+                    uint8_t *m, size_t mlen,
+                    uint8_t *ad, size_t adlen,
+                    uint8_t *n, uint8_t *k)
 {
     int err                      = CRYPTO_ERROR;
     unsigned long long long_plen = 0;
+
+    size_t nlen = cipher_ctx->cipher->nonce_len;
+    size_t tlen = cipher_ctx->cipher->tag_len;
 
     switch (cipher_ctx->cipher->method) {
     case AES128GCM:
@@ -297,6 +256,39 @@ aead_get_cipher_type(int method)
 }
 
 static void
+aead_cipher_ctx_set_key(cipher_ctx_t *cipher_ctx, int enc)
+{
+    const digest_type_t *md = mbedtls_md_info_from_string("SHA1");
+    if (md == NULL) {
+        FATAL("SHA1 Digest not found in crypto library");
+    }
+
+    int err = crypto_hkdf(md,
+            cipher_ctx->salt, cipher_ctx->cipher->key_len,
+            cipher_ctx->cipher->key, cipher_ctx->cipher->key_len,
+            (uint8_t *)SUBKEY_INFO, strlen(SUBKEY_INFO),
+            cipher_ctx->skey, cipher_ctx->cipher->key_len);
+    if (err) {
+        FATAL("Unable to generate subkey");
+    }
+
+    memset(cipher_ctx->nonce, 0, cipher_ctx->cipher->nonce_len);
+
+    /* cipher that don't use mbed TLS, just return */
+    if (cipher_ctx->cipher->method >= CHACHA20POLY1305IETF) {
+        return;
+    }
+
+    if (mbedtls_cipher_setkey(cipher_ctx->evp, cipher_ctx->skey,
+                              cipher_ctx->cipher->key_len * 8, enc) != 0) {
+        FATAL("Cannot set mbed TLS cipher key");
+    }
+    if (mbedtls_cipher_reset(cipher_ctx->evp) != 0) {
+        FATAL("Cannot finish preparation of mbed TLS cipher context");
+    }
+}
+
+static void
 aead_cipher_ctx_init(cipher_ctx_t *cipher_ctx, int method, int enc)
 {
     if (method < AES128GCM || method >= AEAD_CIPHER_NUM) {
@@ -324,17 +316,8 @@ aead_cipher_ctx_init(cipher_ctx_t *cipher_ctx, int method, int enc)
     if (mbedtls_cipher_setup(evp, cipher) != 0) {
         FATAL("Cannot initialize mbed TLS cipher context");
     }
-    if (mbedtls_cipher_setkey(evp, cipher_ctx->cipher->key,
-                              cipher_ctx->cipher->key_len * 8, enc) != 0) {
-        mbedtls_cipher_free(evp);
-        FATAL("Cannot set mbed TLS cipher key");
-    }
-    if (mbedtls_cipher_reset(evp) != 0) {
-        mbedtls_cipher_free(evp);
-        FATAL("Cannot finish preparation of mbed TLS cipher context");
-    }
 
-#ifdef DEBUG
+#ifdef SS_DEBUG
     dump("KEY", (char *)cipher_ctx->cipher->key, cipher_ctx->cipher->key_len);
 #endif
 }
@@ -348,21 +331,21 @@ aead_ctx_init(cipher_t *cipher, cipher_ctx_t *cipher_ctx, int enc)
     aead_cipher_ctx_init(cipher_ctx, cipher->method, enc);
 
     if (enc) {
-        rand_bytes(cipher_ctx->nonce, cipher->nonce_len);
+        rand_bytes(cipher_ctx->salt, cipher->key_len);
     }
 }
 
 void
 aead_ctx_release(cipher_ctx_t *cipher_ctx)
 {
-    if (cipher_ctx->cipher->method >= CHACHA20POLY1305IETF) {
-        return;
-    }
-
     if (cipher_ctx->chunk != NULL) {
         bfree(cipher_ctx->chunk);
         ss_free(cipher_ctx->chunk);
         cipher_ctx->chunk = NULL;
+    }
+
+    if (cipher_ctx->cipher->method >= CHACHA20POLY1305IETF) {
+        return;
     }
 
     mbedtls_cipher_free(cipher_ctx->evp);
@@ -375,51 +358,36 @@ aead_encrypt_all(buffer_t *plaintext, cipher_t *cipher, size_t capacity)
     cipher_ctx_t cipher_ctx;
     aead_ctx_init(cipher, &cipher_ctx, 1);
 
-    size_t nonce_len = cipher->nonce_len;
+    size_t salt_len  = cipher->key_len;
     size_t tag_len   = cipher->tag_len;
     int err          = CRYPTO_OK;
 
     static buffer_t tmp = { 0, 0, 0, NULL };
-    brealloc(&tmp, nonce_len + tag_len + plaintext->len, capacity);
+    brealloc(&tmp, salt_len + tag_len + plaintext->len, capacity);
     buffer_t *ciphertext = &tmp;
     ciphertext->len = tag_len + plaintext->len;
 
-    // generate nonce
-    uint8_t *nonce = cipher_ctx.nonce;
-    /* copy nonce to first pos */
-    memcpy(ciphertext->data, nonce, nonce_len);
+    /* copy salt to first pos */
+    memcpy(ciphertext->data, cipher_ctx.salt, salt_len);
+
+    aead_cipher_ctx_set_key(&cipher_ctx, 1);
 
     size_t clen = ciphertext->len;
-    err = cipher_aead_encrypt(&cipher_ctx,
-                              (uint8_t *)ciphertext->data + nonce_len,
-                              &clen,
-                              (uint8_t *)plaintext->data,
-                              plaintext->len,
-                              NULL,
-                              0,
-                              nonce,
-                              cipher->key,
-                              nonce_len,
-                              tag_len);
-
-    if (err) {
-        bfree(plaintext);
-        aead_ctx_release(&cipher_ctx);
-        return CRYPTO_ERROR;
-    }
-
-#ifdef DEBUG
-    dump("PLAIN", plaintext->data, plaintext->len);
-    dump("CIPHER", ciphertext->data + nonce_len, ciphertext->len);
-#endif
+    err = aead_cipher_encrypt(&cipher_ctx,
+                              (uint8_t *)ciphertext->data + salt_len, &clen,
+                              (uint8_t *)plaintext->data, plaintext->len,
+                              NULL, 0, cipher_ctx.nonce, cipher_ctx.skey);
 
     aead_ctx_release(&cipher_ctx);
 
+    if (err)
+        return CRYPTO_ERROR;
+
     assert(ciphertext->len == clen);
 
-    brealloc(plaintext, nonce_len + ciphertext->len, capacity);
-    memcpy(plaintext->data, ciphertext->data, nonce_len + ciphertext->len);
-    plaintext->len = nonce_len + ciphertext->len;
+    brealloc(plaintext, salt_len + ciphertext->len, capacity);
+    memcpy(plaintext->data, ciphertext->data, salt_len + ciphertext->len);
+    plaintext->len = salt_len + ciphertext->len;
 
     return CRYPTO_OK;
 }
@@ -427,11 +395,11 @@ aead_encrypt_all(buffer_t *plaintext, cipher_t *cipher, size_t capacity)
 int
 aead_decrypt_all(buffer_t *ciphertext, cipher_t *cipher, size_t capacity)
 {
-    size_t nonce_len = cipher->nonce_len;
+    size_t salt_len  = cipher->key_len;
     size_t tag_len   = cipher->tag_len;
     int err          = CRYPTO_OK;
 
-    if (ciphertext->len <= nonce_len + tag_len) {
+    if (ciphertext->len <= salt_len + tag_len) {
         return CRYPTO_ERROR;
     }
 
@@ -441,37 +409,32 @@ aead_decrypt_all(buffer_t *ciphertext, cipher_t *cipher, size_t capacity)
     static buffer_t tmp = { 0, 0, 0, NULL };
     brealloc(&tmp, ciphertext->len, capacity);
     buffer_t *plaintext = &tmp;
-    plaintext->len = ciphertext->len - nonce_len - tag_len;
+    plaintext->len = ciphertext->len - salt_len - tag_len;
 
-    /* get nonce */
-    uint8_t *nonce = cipher_ctx.nonce;
-    memcpy(nonce, ciphertext->data, nonce_len);
+    /* get salt */
+    uint8_t *salt = cipher_ctx.salt;
+    memcpy(salt, ciphertext->data, salt_len);
 
-    size_t plen = plaintext->len;
-    err = cipher_aead_decrypt(&cipher_ctx,
-                              (uint8_t *)plaintext->data,
-                              &plen,
-                              (uint8_t *)ciphertext->data + nonce_len,
-                              ciphertext->len - nonce_len,
-                              NULL,
-                              0,
-                              nonce,
-                              cipher->key,
-                              nonce_len,
-                              tag_len);
-
-    if (err) {
-        bfree(ciphertext);
-        aead_ctx_release(&cipher_ctx);
+    if (ppbloom_check((void *)salt, salt_len) == 1) {
+        LOGE("crypto: AEAD: repeat salt detected");
         return CRYPTO_ERROR;
     }
 
-#ifdef DEBUG
-    dump("PLAIN", plaintext->data, plaintext->len);
-    dump("CIPHER", ciphertext->data + nonce_len, ciphertext->len - nonce_len);
-#endif
+    aead_cipher_ctx_set_key(&cipher_ctx, 0);
+
+    size_t plen = plaintext->len;
+    err = aead_cipher_decrypt(&cipher_ctx,
+                              (uint8_t *)plaintext->data, &plen,
+                              (uint8_t *)ciphertext->data + salt_len,
+                              ciphertext->len - salt_len, NULL, 0,
+                              cipher_ctx.nonce, cipher_ctx.skey);
 
     aead_ctx_release(&cipher_ctx);
+
+    if (err)
+        return CRYPTO_ERROR;
+
+    ppbloom_add((void *)salt, salt_len);
 
     brealloc(ciphertext, plaintext->len, capacity);
     memcpy(ciphertext->data, plaintext->data, plaintext->len);
@@ -481,10 +444,13 @@ aead_decrypt_all(buffer_t *ciphertext, cipher_t *cipher, size_t capacity)
 }
 
 static int
-aead_chunk_encrypt(cipher_ctx_t *ctx, uint8_t *p, uint8_t *c, uint8_t *n,
-                   uint16_t plen, size_t nlen, size_t tlen)
+aead_chunk_encrypt(cipher_ctx_t *ctx, uint8_t *p, uint8_t *c,
+                   uint8_t *n, uint16_t plen)
 {
-    assert(plen + tlen < CHUNK_SIZE_MASK);
+    size_t nlen = ctx->cipher->nonce_len;
+    size_t tlen = ctx->cipher->tag_len;
+
+    assert(plen <= CHUNK_SIZE_MASK);
 
     int err;
     size_t clen;
@@ -493,19 +459,21 @@ aead_chunk_encrypt(cipher_ctx_t *ctx, uint8_t *p, uint8_t *c, uint8_t *n,
     memcpy(len_buf, &t, CHUNK_SIZE_LEN);
 
     clen = CHUNK_SIZE_LEN + tlen;
-    err  = cipher_aead_encrypt(ctx, c, &clen, len_buf, CHUNK_SIZE_LEN,
-                               NULL, 0, n, ctx->cipher->key, nlen, tlen);
+    err  = aead_cipher_encrypt(ctx, c, &clen, len_buf, CHUNK_SIZE_LEN,
+                               NULL, 0, n, ctx->skey);
     if (err)
         return CRYPTO_ERROR;
+
     assert(clen == CHUNK_SIZE_LEN + tlen);
 
     sodium_increment(n, nlen);
 
     clen = plen + tlen;
-    err  = cipher_aead_encrypt(ctx, c + CHUNK_SIZE_LEN + tlen, &clen, p, plen,
-                               NULL, 0, n, ctx->cipher->key, nlen, tlen);
+    err  = aead_cipher_encrypt(ctx, c + CHUNK_SIZE_LEN + tlen, &clen,p, plen,
+                               NULL, 0, n, ctx->skey);
     if (err)
         return CRYPTO_ERROR;
+
     assert(clen == plen + tlen);
 
     sodium_increment(n, nlen);
@@ -529,35 +497,31 @@ aead_encrypt(buffer_t *plaintext, cipher_ctx_t *cipher_ctx, size_t capacity)
 
     cipher_t *cipher  = cipher_ctx->cipher;
     int err           = CRYPTO_ERROR;
-    size_t nonce_ofst = 0;
-    size_t nonce_len  = cipher->nonce_len;
+    size_t salt_ofst  = 0;
+    size_t salt_len   = cipher->key_len;
     size_t tag_len    = cipher->tag_len;
 
     if (!cipher_ctx->init) {
-        nonce_ofst = nonce_len;
+        salt_ofst = salt_len;
     }
 
-    size_t out_len = nonce_ofst + 2 * tag_len + plaintext->len + CHUNK_SIZE_LEN;
+    size_t out_len = salt_ofst + 2 * tag_len + plaintext->len + CHUNK_SIZE_LEN;
     brealloc(&tmp, out_len, capacity);
     ciphertext      = &tmp;
     ciphertext->len = out_len;
 
     if (!cipher_ctx->init) {
-        memcpy(ciphertext->data, cipher_ctx->nonce, nonce_len);
+        memcpy(ciphertext->data, cipher_ctx->salt, salt_len);
+        aead_cipher_ctx_set_key(cipher_ctx, 1);
         cipher_ctx->init = 1;
     }
 
     err = aead_chunk_encrypt(cipher_ctx,
                              (uint8_t *)plaintext->data,
-                             (uint8_t *)ciphertext->data + nonce_ofst,
-                             cipher_ctx->nonce, plaintext->len, nonce_len, tag_len);
+                             (uint8_t *)ciphertext->data + salt_ofst,
+                             cipher_ctx->nonce, plaintext->len);
     if (err)
         return err;
-
-#ifdef DEBUG
-    dump("PLAIN", plaintext->data, plaintext->len);
-    dump("CIPHER", ciphertext->data + nonce_ofst, ciphertext->len);
-#endif
 
     brealloc(plaintext, ciphertext->len, capacity);
     memcpy(plaintext->data, ciphertext->data, ciphertext->len);
@@ -568,23 +532,28 @@ aead_encrypt(buffer_t *plaintext, cipher_ctx_t *cipher_ctx, size_t capacity)
 
 static int
 aead_chunk_decrypt(cipher_ctx_t *ctx, uint8_t *p, uint8_t *c, uint8_t *n,
-                   size_t *plen, size_t *clen, size_t nlen, size_t tlen)
+                   size_t *plen, size_t *clen)
 {
     int err;
     size_t mlen;
+    size_t nlen = ctx->cipher->nonce_len;
+    size_t tlen = ctx->cipher->tag_len;
 
     if (*clen <= 2 * tlen + CHUNK_SIZE_LEN)
         return CRYPTO_NEED_MORE;
 
     uint8_t len_buf[2];
-    err = cipher_aead_decrypt(ctx, len_buf, plen, c, CHUNK_SIZE_LEN + tlen,
-                              NULL, 0, n, ctx->cipher->key, nlen, tlen);
+    err = aead_cipher_decrypt(ctx, len_buf, plen, c, CHUNK_SIZE_LEN + tlen,
+                              NULL, 0, n, ctx->skey);
     if (err)
         return CRYPTO_ERROR;
     assert(*plen == CHUNK_SIZE_LEN);
 
     mlen = ntohs(*(uint16_t *)len_buf);
     mlen = mlen & CHUNK_SIZE_MASK;
+
+    if (mlen == 0)
+        return CRYPTO_ERROR;
 
     size_t chunk_len = 2 * tlen + CHUNK_SIZE_LEN + mlen;
 
@@ -593,8 +562,8 @@ aead_chunk_decrypt(cipher_ctx_t *ctx, uint8_t *p, uint8_t *c, uint8_t *n,
 
     sodium_increment(n, nlen);
 
-    err = cipher_aead_decrypt(ctx, p, plen, c + CHUNK_SIZE_LEN + tlen, mlen + tlen,
-                              NULL, 0, n, ctx->cipher->key, nlen, tlen);
+    err = aead_cipher_decrypt(ctx, p, plen, c + CHUNK_SIZE_LEN + tlen, mlen + tlen,
+                              NULL, 0, n, ctx->skey);
     if (err)
         return CRYPTO_ERROR;
     assert(*plen == mlen);
@@ -617,8 +586,7 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
 
     cipher_t *cipher = cipher_ctx->cipher;
 
-    size_t nonce_len = cipher->nonce_len;
-    size_t tag_len   = cipher->tag_len;
+    size_t salt_len  = cipher->key_len;
 
     if (cipher_ctx->chunk == NULL) {
         cipher_ctx->chunk = (buffer_t *)ss_malloc(sizeof(buffer_t));
@@ -636,22 +604,27 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
     buffer_t *plaintext = &tmp;
 
     if (!cipher_ctx->init) {
-        if (cipher_ctx->chunk->len <= nonce_len)
+        if (cipher_ctx->chunk->len <= salt_len)
             return CRYPTO_NEED_MORE;
-        memcpy(cipher_ctx->nonce, cipher_ctx->chunk->data, nonce_len);
 
-        if (cache_key_exist(nonce_cache, (char *)cipher_ctx->nonce, nonce_len)) {
-            bfree(ciphertext);
+        memcpy(cipher_ctx->salt, cipher_ctx->chunk->data, salt_len);
+
+        aead_cipher_ctx_set_key(cipher_ctx, 0);
+
+        if (ppbloom_check((void *)cipher_ctx->salt, salt_len) == 1) {
+            LOGE("crypto: AEAD: repeat salt detected");
             return CRYPTO_ERROR;
-        } else {
-            cache_insert(nonce_cache, (char *)cipher_ctx->nonce, nonce_len, NULL);
         }
 
-        memmove(cipher_ctx->chunk->data, cipher_ctx->chunk->data + nonce_len,
-                cipher_ctx->chunk->len - nonce_len);
-        cipher_ctx->chunk->len -= nonce_len;
+        memmove(cipher_ctx->chunk->data, cipher_ctx->chunk->data + salt_len,
+                cipher_ctx->chunk->len - salt_len);
+        cipher_ctx->chunk->len -= salt_len;
 
         cipher_ctx->init = 1;
+
+    } else if (cipher_ctx->init == 1) {
+        ppbloom_add((void *)cipher_ctx->salt, salt_len);
+        cipher_ctx->init = 2;
     }
 
     size_t plen = 0;
@@ -661,9 +634,7 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
         err = aead_chunk_decrypt(cipher_ctx,
                                  (uint8_t *)plaintext->data + plen,
                                  (uint8_t *)cipher_ctx->chunk->data,
-                                 cipher_ctx->nonce,
-                                 &chunk_plen, &chunk_clen,
-                                 nonce_len, tag_len);
+                                 cipher_ctx->nonce, &chunk_plen, &chunk_clen);
         if (err == CRYPTO_ERROR) {
             return err;
         } else if (err == CRYPTO_NEED_MORE) {
@@ -676,11 +647,6 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
         plen                  += chunk_plen;
     }
     plaintext->len = plen;
-
-#ifdef DEBUG
-    dump("PLAIN", plaintext->data, plaintext->len);
-    dump("CIPHER", ciphertext->data + nonce_len, ciphertext->len - nonce_len);
-#endif
 
     brealloc(ciphertext, plaintext->len, capacity);
     memcpy(ciphertext->data, plaintext->data, plaintext->len);
@@ -697,16 +663,8 @@ aead_key_init(int method, const char *pass, const char *key)
         return NULL;
     }
 
-    // Initialize cache
-    cache_create(&nonce_cache, 1024, NULL);
-
     cipher_t *cipher = (cipher_t *)ss_malloc(sizeof(cipher_t));
     memset(cipher, 0, sizeof(cipher_t));
-
-    // Initialize sodium for random generator
-    if (sodium_init() == -1) {
-        FATAL("Failed to initialize sodium");
-    }
 
     if (method >= CHACHA20POLY1305IETF) {
         cipher_kt_t *cipher_info = (cipher_kt_t *)ss_malloc(sizeof(cipher_kt_t));

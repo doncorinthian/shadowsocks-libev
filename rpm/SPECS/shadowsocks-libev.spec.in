@@ -7,11 +7,14 @@ Group:		Applications/Internet
 License:	GPLv3+
 URL:		https://github.com/shadowsocks/%{name}
 Source0:	%{url}/archive/v%{version}.tar.gz
+Patch0:     0001-systemd-services.patch
 
 AutoReq:        no
 Conflicts:	    python-shadowsocks python3-shadowsocks
-BuildRequires:	make gcc pcre-devel asciidoc xmlto
-Requires:       pcre
+BuildRequires:	make gcc pcre-devel asciidoc xmlto automake libtool mbedtls-devel libsodium-devel >= 1.0.4 libev-devel udns-devel
+Requires:       pcre mbedtls libsodium >= 1.0.4
+Requires:       libev udns
+
 
 %if 0%{?suse_version}
 Requires:       libopenssl1_0_0
@@ -36,11 +39,6 @@ BuildRequires:   systemd
 %endif
 %endif
 
-%if 0%{?use_system_lib}
-BuildRequires:  libev-devel libsodium-devel >= 1.0.4 udns-devel
-Requires:       libev libsodium >= 1.0.4 udns
-%endif
-
 
 %description
 shadowsocks-libev is a lightweight secured scoks5 proxy for embedded devices and low end boxes.
@@ -48,9 +46,11 @@ shadowsocks-libev is a lightweight secured scoks5 proxy for embedded devices and
 
 %prep
 %setup -q
-
+%patch0 -p1
 
 %build
+./autogen.sh
+
 %if 0%{?use_system_lib}
 %configure --enable-shared --enable-system-shared-lib
 %else
@@ -66,13 +66,14 @@ mkdir -p %{buildroot}/etc/shadowsocks-libev
 mkdir -p %{buildroot}%{_initddir}
 install -m 755 %{_builddir}/%{buildsubdir}/rpm/SOURCES/etc/init.d/shadowsocks-libev %{buildroot}%{_initddir}/shadowsocks-libev
 %else
-mkdir -p %{buildroot}%{_sysconfdir}/default
+mkdir -p %{buildroot}%{_sysconfdir}/sysconfig
 mkdir -p %{buildroot}%{_unitdir}
-install -m 644 %{_builddir}/%{buildsubdir}/debian/shadowsocks-libev.default %{buildroot}%{_sysconfdir}/default/shadowsocks-libev
+install -m 644 %{_builddir}/%{buildsubdir}/debian/shadowsocks-libev.default %{buildroot}%{_sysconfdir}/sysconfig/shadowsocks-libev
 install -m 644 %{_builddir}/%{buildsubdir}/debian/shadowsocks-libev.service %{buildroot}%{_unitdir}/shadowsocks-libev.service
 install -m 644 %{_builddir}/%{buildsubdir}/debian/shadowsocks-libev-*.service %{buildroot}%{_unitdir}/
 %endif
 install -m 644 %{_builddir}/%{buildsubdir}/debian/config.json %{buildroot}%{_sysconfdir}/shadowsocks-libev/config.json
+
 mkdir -p %{buildroot}%{_datadir}/bash-completion/completions/
 install -m 644 %{_builddir}/%{buildsubdir}/completions/bash/* %{buildroot}%{_datadir}/bash-completion/completions/
 
@@ -82,6 +83,7 @@ install -m 644 %{_builddir}/%{buildsubdir}/completions/bash/* %{buildroot}%{_dat
 %endif
 
 %post
+/sbin/ldconfig
 %if ! 0%{?use_systemd}
 /sbin/chkconfig --add shadowsocks-libev > /dev/null 2>&1 || :
 %else
@@ -107,6 +109,7 @@ fi
 %endif
 
 %postun
+/sbin/ldconfig
 %if 0%{?use_systemd}
 %if 0%{?suse_version}
 %service_del_postun shadowsocks-libev.service
@@ -133,7 +136,7 @@ fi
 %else
 %{_unitdir}/shadowsocks-libev.service
 %{_unitdir}/shadowsocks-libev-*.service
-%config(noreplace) %{_sysconfdir}/default/shadowsocks-libev
+%config(noreplace) %{_sysconfdir}/sysconfig/shadowsocks-libev
 %endif
 
 %package devel

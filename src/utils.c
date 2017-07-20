@@ -37,6 +37,7 @@
 
 #include <sodium.h>
 
+#include "crypto.h"
 #include "utils.h"
 
 #ifdef HAVE_SETRLIMIT
@@ -230,6 +231,23 @@ ss_malloc(size_t size)
 }
 
 void *
+ss_align(size_t size)
+{
+    int err;
+    void *tmp = NULL;
+#ifdef HAVE_POSIX_MEMALIGN
+    err = posix_memalign(&tmp, sizeof(void *), size);
+#else
+    err = -1;
+#endif
+    if (err) {
+        return ss_malloc(size);
+    } else {
+        return tmp;
+    }
+}
+
+void *
 ss_realloc(void *ptr, size_t new_size)
 {
     void *new = realloc(ptr, new_size);
@@ -283,6 +301,10 @@ usage()
         "                                  camellia-256-cfb, bf-cfb,\n");
     printf(
         "                                  chacha20-ietf-poly1305,\n");
+#ifdef FS_HAVE_XCHACHA20IETF
+    printf(
+        "                                  xchacha20-ietf-poly1305,\n");
+#endif
     printf(
         "                                  salsa20, chacha20 and chacha20-ietf.\n");
     printf(
@@ -332,11 +354,13 @@ usage()
 #endif
     printf(
         "       [--reuse-port]             Enable port reuse.\n");
-#if defined(MODULE_REMOTE) || defined(MODULE_LOCAL)
+#if defined(MODULE_REMOTE) || defined(MODULE_LOCAL) || defined(MODULE_REDIR)
     printf(
         "       [--fast-open]              Enable TCP fast open.\n");
     printf(
         "                                  with Linux kernel > 3.7.0.\n");
+#endif
+#if defined(MODULE_REMOTE) || defined(MODULE_LOCAL)
     printf(
         "       [--acl <acl_file>]         Path to ACL (Access Control List).\n");
 #endif

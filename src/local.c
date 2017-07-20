@@ -89,7 +89,7 @@ int verbose        = 0;
 int reuse_port     = 0;
 int keep_resolving = 1;
 
-#ifdef ANDROID
+#ifdef __ANDROID__
 int vpn        = 0;
 uint64_t tx    = 0;
 uint64_t rx    = 0;
@@ -102,6 +102,7 @@ static int acl       = 0;
 static int mode      = TCP_ONLY;
 static int ipv6first = 0;
 static int fast_open = 0;
+static int udp_fd    = 0;
 
 static struct ev_signal sigint_watcher;
 static struct ev_signal sigterm_watcher;
@@ -156,10 +157,17 @@ create_and_bind(const char *addr, const char *port)
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family   = AF_UNSPEC;   /* Return IPv4 and IPv6 choices */
     hints.ai_socktype = SOCK_STREAM; /* We want a TCP socket */
+    result = NULL;
 
     s = getaddrinfo(addr, port, &hints, &result);
+
     if (s != 0) {
         LOGI("getaddrinfo: %s", gai_strerror(s));
+        return -1;
+    }
+
+    if (result == NULL) {
+        LOGE("Could not bind");
         return -1;
     }
 
@@ -190,11 +198,7 @@ create_and_bind(const char *addr, const char *port)
         }
 
         close(listen_sock);
-    }
-
-    if (rp == NULL) {
-        LOGE("Could not bind");
-        return -1;
+        listen_sock = -1;
     }
 
     freeaddrinfo(result);
@@ -245,6 +249,16 @@ free_connections(struct ev_loop *loop)
 }
 
 static void
+delayed_connect_cb(EV_P_ ev_timer *watcher, int revents)
+{
+    server_t *server = cork_container_of(watcher, server_t,
+                                         delayed_connect_watcher);
+
+    server->stage = STAGE_WAIT;
+    server_recv_cb(EV_A_ & server->recv_ctx->io, revents);
+}
+
+static void
 server_recv_cb(EV_P_ ev_io *w, int revents)
 {
     server_ctx_t *server_recv_ctx = (server_ctx_t *)w;
@@ -259,28 +273,31 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         buf = remote->buf;
     }
 
-    r = recv(server->fd, buf->data + buf->len, BUF_SIZE - buf->len, 0);
+    if (server->stage != STAGE_WAIT) {
+        r = recv(server->fd, buf->data + buf->len, BUF_SIZE - buf->len, 0);
 
-    if (r == 0) {
-        // connection closed
-        close_and_free_remote(EV_A_ remote);
-        close_and_free_server(EV_A_ server);
-        return;
-    } else if (r == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // no data
-            // continue to wait for recv
-            return;
-        } else {
-            if (verbose)
-                ERROR("server_recv_cb_recv");
+        if (r == 0) {
+            // connection closed
             close_and_free_remote(EV_A_ remote);
             close_and_free_server(EV_A_ server);
             return;
+        } else if (r == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // no data
+                // continue to wait for recv
+                return;
+            } else {
+                if (verbose)
+                    ERROR("server_recv_cb_recv");
+                close_and_free_remote(EV_A_ remote);
+                close_and_free_server(EV_A_ server);
+                return;
+            }
         }
+        buf->len += r;
+    } else {
+        server->stage = STAGE_STREAM;
     }
-
-    buf->len += r;
 
     while (1) {
         // local socks5 server
@@ -291,9 +308,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 return;
             }
 
+            ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
+
             // insert shadowsocks header
             if (!remote->direct) {
-#ifdef ANDROID
+#ifdef __ANDROID__
                 tx += remote->buf->len;
 #endif
                 int err = crypto->encrypt(remote->buf, server->e_ctx, BUF_SIZE);
@@ -314,7 +333,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             }
 
             if (!remote->send_ctx->connected) {
-#ifdef ANDROID
+#ifdef __ANDROID__
                 if (vpn) {
                     int not_protect = 0;
                     if (remote->addr.ss_family == AF_INET) {
@@ -447,6 +466,14 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             // all processed
             return;
         } else if (server->stage == STAGE_INIT) {
+            if (buf->len < sizeof(struct method_select_request) + 1) {
+                return;
+            }
+            struct method_select_request *method = (struct method_select_request *)buf->data;
+            int method_len = method->nmethods + sizeof(struct method_select_request);
+            if (buf->len < method_len) {
+                return;
+            }
             struct method_select_response response;
             response.ver    = SVERSION;
             response.method = 0;
@@ -454,27 +481,30 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             send(server->fd, send_buf, sizeof(response), 0);
             server->stage = STAGE_HANDSHAKE;
 
-            int off = (buf->data[1] & 0xff) + 2;
-            if (buf->data[0] == 0x05 && off < (int)(buf->len)) {
-                memmove(buf->data, buf->data + off, buf->len - off);
-                buf->len -= off;
+            if (method->ver == SVERSION && method_len < (int)(buf->len)) {
+                memmove(buf->data, buf->data + method_len , buf->len - method_len);
+                buf->len -= method_len;
                 continue;
             }
 
             buf->len = 0;
-
             return;
         } else if (server->stage == STAGE_HANDSHAKE || server->stage == STAGE_PARSE) {
             struct socks5_request *request = (struct socks5_request *)buf->data;
+            size_t request_len = sizeof(struct socks5_request);
             struct sockaddr_in sock_addr;
             memset(&sock_addr, 0, sizeof(sock_addr));
+
+            if (buf->len < request_len) {
+                return;
+            }
 
             int udp_assc = 0;
 
             if (request->cmd == 3) {
                 udp_assc = 1;
                 socklen_t addr_len = sizeof(sock_addr);
-                getsockname(server->fd, (struct sockaddr *)&sock_addr,
+                getsockname(udp_fd, (struct sockaddr *)&sock_addr,
                             &addr_len);
                 if (verbose) {
                     LOGI("udp assc request accepted");
@@ -526,8 +556,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                     return;
                 }
                 if (udp_assc) {
-                    close_and_free_remote(EV_A_ remote);
-                    close_and_free_server(EV_A_ server);
+                    // Wait until client closes the connection
                     return;
                 }
             }
@@ -545,38 +574,48 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             if (atyp == 1) {
                 // IP V4
                 size_t in_addr_len = sizeof(struct in_addr);
-                memcpy(abuf->data + abuf->len, buf->data + 4, in_addr_len + 2);
+                if (buf->len < request_len + in_addr_len + 2) {
+                    return;
+                }
+                memcpy(abuf->data + abuf->len, buf->data + request_len, in_addr_len + 2);
                 abuf->len += in_addr_len + 2;
 
                 if (acl || verbose) {
-                    uint16_t p = ntohs(*(uint16_t *)(buf->data + 4 + in_addr_len));
-                    dns_ntop(AF_INET, (const void *)(buf->data + 4),
+                    uint16_t p = ntohs(*(uint16_t *)(buf->data + request_len + in_addr_len));
+                    dns_ntop(AF_INET, (const void *)(buf->data + request_len),
                              ip, INET_ADDRSTRLEN);
                     sprintf(port, "%d", p);
                 }
             } else if (atyp == 3) {
                 // Domain name
-                uint8_t name_len = *(uint8_t *)(buf->data + 4);
+                uint8_t name_len = *(uint8_t *)(buf->data + request_len);
+                if (buf->len < request_len + 1 + name_len + 2) {
+                    return;
+                }
                 abuf->data[abuf->len++] = name_len;
-                memcpy(abuf->data + abuf->len, buf->data + 4 + 1, name_len + 2);
+                memcpy(abuf->data + abuf->len, buf->data + request_len + 1, name_len + 2);
                 abuf->len += name_len + 2;
 
                 if (acl || verbose) {
                     uint16_t p =
-                        ntohs(*(uint16_t *)(buf->data + 4 + 1 + name_len));
-                    memcpy(host, buf->data + 4 + 1, name_len);
+                        ntohs(*(uint16_t *)(buf->data + request_len + 1 + name_len));
+                    memcpy(host, buf->data + request_len + 1, name_len);
                     host[name_len] = '\0';
                     sprintf(port, "%d", p);
+
                 }
             } else if (atyp == 4) {
                 // IP V6
                 size_t in6_addr_len = sizeof(struct in6_addr);
-                memcpy(abuf->data + abuf->len, buf->data + 4, in6_addr_len + 2);
+                if (buf->len < request_len + in6_addr_len + 2) {
+                    return;
+                }
+                memcpy(abuf->data + abuf->len, buf->data + request_len, in6_addr_len + 2);
                 abuf->len += in6_addr_len + 2;
 
                 if (acl || verbose) {
-                    uint16_t p = ntohs(*(uint16_t *)(buf->data + 4 + in6_addr_len));
-                    dns_ntop(AF_INET6, (const void *)(buf->data + 4),
+                    uint16_t p = ntohs(*(uint16_t *)(buf->data + request_len + in6_addr_len));
+                    dns_ntop(AF_INET6, (const void *)(buf->data + request_len),
                              ip, INET6_ADDRSTRLEN);
                     sprintf(port, "%d", p);
                 }
@@ -641,14 +680,45 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                     LOGI("connect to [%s]:%s", ip, port);
             }
 
-            if (acl) {
+            if (acl
+#ifdef __ANDROID__
+                    && !(vpn && strcmp(port, "53") == 0)
+#endif
+                    ) {
                 int host_match = acl_match_host(host);
                 int bypass = 0;
+                int resolved = 0;
+                struct sockaddr_storage storage;
+                memset(&storage, 0, sizeof(struct sockaddr_storage));
+                int err;
+
                 if (host_match > 0)
                     bypass = 1;                 // bypass hostnames in black list
                 else if (host_match < 0)
                     bypass = 0;                 // proxy hostnames in white list
                 else {
+#ifndef __ANDROID__
+                    if (atyp == 3) {            // resolve domain so we can bypass domain with geoip
+                        err = get_sockaddr(host, port, &storage, 0, ipv6first);
+                        if (err != -1) {
+                            resolved = 1;
+                            switch(((struct sockaddr*)&storage)->sa_family) {
+                                case AF_INET: {
+                                    struct sockaddr_in *addr_in = (struct sockaddr_in *)&storage;
+                                    dns_ntop(AF_INET, &(addr_in->sin_addr), ip, INET_ADDRSTRLEN);
+                                    break;
+                                }
+                                case AF_INET6: {
+                                    struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *)&storage;
+                                    dns_ntop(AF_INET6, &(addr_in6->sin6_addr), ip, INET6_ADDRSTRLEN);
+                                    break;
+                                }
+                                default:
+                                    break;
+                            }
+                        }
+                    }
+#endif
                     int ip_match = acl_match_host(ip);
                     switch (get_acl_mode()) {
                         case BLACK_LIST:
@@ -672,15 +742,12 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                         else if (atyp == 4)
                             LOGI("bypass [%s]:%s", ip, port);
                     }
-                    int err;
-                    struct sockaddr_storage storage;
-                    memset(&storage, 0, sizeof(struct sockaddr_storage));
-#ifndef ANDROID
-                    if (sni_detected || atyp == 3)
-                       err = get_sockaddr(host, port, &storage, 0, ipv6first);
+#ifndef __ANDROID__
+                    if (atyp == 3 && resolved != 1)
+                        err = get_sockaddr(host, port, &storage, 0, ipv6first);
                     else
 #endif
-                       err = get_sockaddr(ip, port, &storage, 0, ipv6first);
+                        err = get_sockaddr(ip, port, &storage, 0, ipv6first);
                     if (err != -1) {
                         remote = create_remote(server->listener, (struct sockaddr *)&storage);
                         if (remote != NULL)
@@ -717,6 +784,10 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
             server->remote = remote;
             remote->server = server;
+
+            ev_timer_start(EV_A_ & server->delayed_connect_watcher);
+
+            return;
         }
     }
 }
@@ -759,12 +830,12 @@ server_send_cb(EV_P_ ev_io *w, int revents)
     }
 }
 
-#ifdef ANDROID
-static void
+#ifdef __ANDROID__
+void
 stat_update_cb()
 {
     ev_tstamp now = ev_time();
-    if (now - last > 1.0) {
+    if (now - last > 0.5) {
         send_traffic_stat(tx, rx);
         last = now;
     }
@@ -798,10 +869,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     ev_timer_again(EV_A_ & remote->recv_ctx->watcher);
 
-#ifdef ANDROID
-    stat_update_cb();
-#endif
-
     ssize_t r = recv(remote->fd, server->buf->data, BUF_SIZE, 0);
 
     if (r == 0) {
@@ -825,8 +892,9 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     server->buf->len = r;
 
     if (!remote->direct) {
-#ifdef ANDROID
+#ifdef __ANDROID__
         rx += server->buf->len;
+        stat_update_cb();
 #endif
         int err = crypto->decrypt(server->buf, server->d_ctx, BUF_SIZE);
         if (err == CRYPTO_ERROR) {
@@ -1014,13 +1082,16 @@ new_server(int fd)
     server->recv_ctx->server    = server;
     server->send_ctx->server    = server;
 
-    server->e_ctx = ss_malloc(sizeof(cipher_ctx_t));
-    server->d_ctx = ss_malloc(sizeof(cipher_ctx_t));
+    server->e_ctx = ss_align(sizeof(cipher_ctx_t));
+    server->d_ctx = ss_align(sizeof(cipher_ctx_t));
     crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
     crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
 
     ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
     ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
+
+    ev_timer_init(&server->delayed_connect_watcher,
+            delayed_connect_cb, 0.05, 0);
 
     cork_dllist_add(&connections, &server->entries);
 
@@ -1062,6 +1133,7 @@ close_and_free_server(EV_P_ server_t *server)
     if (server != NULL) {
         ev_io_stop(EV_A_ & server->send_ctx->io);
         ev_io_stop(EV_A_ & server->recv_ctx->io);
+        ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
         close(server->fd);
         free_server(server);
     }
@@ -1093,9 +1165,21 @@ create_remote(listen_ctx_t *listener,
     setsockopt(remotefd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
 
-    if (listener->mptcp == 1) {
-        int err = setsockopt(remotefd, SOL_TCP, MPTCP_ENABLED, &opt, sizeof(opt));
+    if (listener->mptcp > 1) {
+        int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
         if (err == -1) {
+            ERROR("failed to enable multipath TCP");
+        }
+    } else if (listener->mptcp == 1) {
+        int i = 0;
+        while((listener->mptcp = mptcp_enabled_values[i]) > 0) {
+            int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
+            if (err != -1) {
+                break;
+            }
+            i++;
+        }
+        if (listener->mptcp == 0) {
             ERROR("failed to enable multipath TCP");
         }
     }
@@ -1210,11 +1294,11 @@ main(int argc, char **argv)
 
     USE_TTY();
 
-#ifdef ANDROID
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:n:huUvV6",
+#ifdef __ANDROID__
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:n:huUvV6A",
                             long_options, NULL)) != -1) {
 #else
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:n:huUv6",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:i:c:b:a:n:huUv6A",
                             long_options, NULL)) != -1) {
 #endif
         switch (c) {
@@ -1304,11 +1388,14 @@ main(int argc, char **argv)
         case '6':
             ipv6first = 1;
             break;
-#ifdef ANDROID
+#ifdef __ANDROID__
         case 'V':
             vpn = 1;
             break;
 #endif
+        case 'A':
+            FATAL("One time auth has been deprecated. Try AEAD ciphers instead.");
+            break;
         case '?':
             // The option character is not recognized.
             LOGE("Unrecognized option: %s", optarg);
@@ -1384,6 +1471,9 @@ main(int argc, char **argv)
             nofile = conf->nofile;
         }
 #endif
+        if (ipv6first == 0) {
+            ipv6first = conf->ipv6_first;
+        }
     }
 
     if (remote_num == 0 || remote_port == NULL ||
@@ -1547,7 +1637,7 @@ main(int argc, char **argv)
             FATAL("failed to resolve the provided hostname");
         }
         struct sockaddr *addr = (struct sockaddr *)storage;
-        init_udprelay(local_addr, local_port, addr,
+        udp_fd = init_udprelay(local_addr, local_port, addr,
                       get_sockaddr_len(addr), mtu, crypto, listen_ctx.timeout, iface);
     }
 
@@ -1556,6 +1646,7 @@ main(int argc, char **argv)
         LOGI("listening through launchd");
     else
 #endif
+
     if (strcmp(local_addr, ":") > 0)
         LOGI("listening at [%s]:%s", local_addr, local_port);
     else
@@ -1659,20 +1750,20 @@ start_ss_local_server(profile_t profile)
     if (crypto == NULL)
         FATAL("failed to init ciphers");
 
-    struct sockaddr_storage *storage = ss_malloc(sizeof(struct sockaddr_storage));
-    memset(storage, 0, sizeof(struct sockaddr_storage));
-    if (get_sockaddr(remote_host, remote_port_str, storage, 0, ipv6first) == -1) {
+    struct sockaddr_storage storage;
+    memset(&storage, 0, sizeof(struct sockaddr_storage));
+    if (get_sockaddr(remote_host, remote_port_str, &storage, 0, ipv6first) == -1) {
         return -1;
     }
 
     // Setup proxy context
     struct ev_loop *loop = EV_DEFAULT;
 
-    struct sockaddr **remote_addr_tmp = ss_malloc(sizeof(struct sockaddr *));
+    struct sockaddr *remote_addr_tmp[MAX_REMOTE_NUM];
     listen_ctx_t listen_ctx;
     listen_ctx.remote_num     = 1;
     listen_ctx.remote_addr    = remote_addr_tmp;
-    listen_ctx.remote_addr[0] = (struct sockaddr *)storage;
+    listen_ctx.remote_addr[0] = (struct sockaddr *)(&storage);
     listen_ctx.timeout        = timeout;
     listen_ctx.iface          = NULL;
     listen_ctx.mptcp          = mptcp;
@@ -1700,8 +1791,8 @@ start_ss_local_server(profile_t profile)
     // Setup UDP
     if (mode != TCP_ONLY) {
         LOGI("udprelay enabled");
-        struct sockaddr *addr = (struct sockaddr *)storage;
-        init_udprelay(local_addr, local_port_str, addr,
+        struct sockaddr *addr = (struct sockaddr *)(&storage);
+        udp_fd = init_udprelay(local_addr, local_port_str, addr,
                       get_sockaddr_len(addr), mtu, crypto, timeout, NULL);
     }
 
@@ -1721,20 +1812,16 @@ start_ss_local_server(profile_t profile)
     }
 
     // Clean up
-    if (mode != TCP_ONLY) {
-        free_udprelay();
-    }
-
     if (mode != UDP_ONLY) {
         ev_io_stop(loop, &listen_ctx.io);
         free_connections(loop);
         close(listen_ctx.fd);
     }
 
-    ss_free(listen_ctx.remote_addr[0]);
-    ss_free(remote_addr_tmp);
+    if (mode != TCP_ONLY) {
+        free_udprelay();
+    }
 
-    // cannot reach here
     return 0;
 }
 
