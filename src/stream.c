@@ -31,11 +31,46 @@
 
 #include <sodium.h>
 
-#include "cache.h"
+#include "ppbloom.h"
 #include "stream.h"
 #include "utils.h"
 
 #define SODIUM_BLOCK_SIZE   64
+
+/*
+ * Spec: http://shadowsocks.org/en/spec/Stream-Ciphers.html
+ *
+ * Stream ciphers provide only confidentiality. Data integrity and authenticity is not guaranteed. Users should use AEAD
+ * ciphers whenever possible.
+ *
+ * Stream Encryption/Decryption
+ *
+ * Stream_encrypt is a function that takes a secret key, an initialization vector, a message, and produces a ciphertext
+ * with the same length as the message.
+ *
+ *      Stream_encrypt(key, IV, message) => ciphertext
+ *
+ * Stream_decrypt is a function that takes a secret key, an initializaiton vector, a ciphertext, and produces the
+ * original message.
+ *
+ *      Stream_decrypt(key, IV, ciphertext) => message
+ *
+ * TCP
+ *
+ * A stream cipher encrypted TCP stream starts with a randomly generated initializaiton vector, followed by encrypted
+ * payload data.
+ *
+ *      [IV][encrypted payload]
+ *
+ * UDP
+ *
+ * A stream cipher encrypted UDP packet has the following structure:
+ *
+ *      [IV][encrypted payload]
+ *
+ * Each UDP packet is encrypted/decrypted independently with a randomly generated initialization vector.
+ *
+ */
 
 #define NONE                -1
 #define TABLE               0
@@ -133,19 +168,6 @@ crypto_stream_xor_ic(uint8_t *c, const uint8_t *m, uint64_t mlen,
     return 0;
 }
 
-#ifdef DEBUG
-void
-dump(char *tag, char *text, int len)
-{
-    int i;
-    printf("%s: ", tag);
-    for (i = 0; i < len; i++)
-        printf("0x%02x ", (uint8_t)text[i]);
-    printf("\n");
-}
-
-#endif
-
 int
 cipher_nonce_size(const cipher_t *cipher)
 {
@@ -229,13 +251,18 @@ stream_cipher_ctx_init(cipher_ctx_t *ctx, int method, int enc)
 }
 
 void
-stream_cipher_ctx_release(cipher_ctx_t *cipher_ctx)
+stream_ctx_release(cipher_ctx_t *cipher_ctx)
 {
     if (cipher_ctx->chunk != NULL) {
         bfree(cipher_ctx->chunk);
         ss_free(cipher_ctx->chunk);
         cipher_ctx->chunk = NULL;
     }
+
+    if (cipher_ctx->cipher->method >= SALSA20) {
+        return;
+    }
+
     mbedtls_cipher_free(cipher_ctx->evp);
     ss_free(cipher_ctx->evp);
 }
@@ -285,7 +312,7 @@ cipher_ctx_set_nonce(cipher_ctx_t *cipher_ctx, uint8_t *nonce, size_t nonce_len,
         FATAL("Cannot finalize mbed TLS cipher context");
     }
 
-#ifdef DEBUG
+#ifdef SS_DEBUG
     dump("NONCE", (char *)nonce, nonce_len);
     dump("KEY", (char *)true_key, 32);
 #endif
@@ -329,19 +356,16 @@ stream_encrypt_all(buffer_t *plaintext, cipher_t *cipher, size_t capacity)
                                 plaintext->len);
     }
 
-    if (err) {
-        bfree(plaintext);
-        stream_ctx_release(&cipher_ctx);
-        return CRYPTO_ERROR;
-    }
+    stream_ctx_release(&cipher_ctx);
 
-#ifdef DEBUG
+    if (err)
+        return CRYPTO_ERROR;
+
+#ifdef SS_DEBUG
     dump("PLAIN", plaintext->data, plaintext->len);
     dump("CIPHER", ciphertext->data + nonce_len, ciphertext->len);
     dump("NONCE", ciphertext->data, nonce_len);
 #endif
-
-    stream_ctx_release(&cipher_ctx);
 
     brealloc(plaintext, nonce_len + ciphertext->len, capacity);
     memcpy(plaintext->data, ciphertext->data, nonce_len + ciphertext->len);
@@ -406,7 +430,7 @@ stream_encrypt(buffer_t *plaintext, cipher_ctx_t *cipher_ctx, size_t capacity)
         }
     }
 
-#ifdef DEBUG
+#ifdef SS_DEBUG
     dump("PLAIN", plaintext->data, plaintext->len);
     dump("CIPHER", ciphertext->data + nonce_len, ciphertext->len);
 #endif
@@ -438,6 +462,12 @@ stream_decrypt_all(buffer_t *ciphertext, cipher_t *cipher, size_t capacity)
 
     uint8_t *nonce = cipher_ctx.nonce;
     memcpy(nonce, ciphertext->data, nonce_len);
+
+    if (ppbloom_check((void *)nonce, nonce_len) == 1) {
+        LOGE("crypto: stream: repeat IV detected");
+        return CRYPTO_ERROR;
+    }
+
     cipher_ctx_set_nonce(&cipher_ctx, nonce, nonce_len, 0);
 
     if (cipher->method >= SALSA20) {
@@ -451,19 +481,18 @@ stream_decrypt_all(buffer_t *ciphertext, cipher_t *cipher, size_t capacity)
                                 ciphertext->len - nonce_len);
     }
 
-    if (err) {
-        bfree(ciphertext);
-        stream_ctx_release(&cipher_ctx);
-        return CRYPTO_ERROR;
-    }
+    stream_ctx_release(&cipher_ctx);
 
-#ifdef DEBUG
+    if (err)
+        return CRYPTO_ERROR;
+
+#ifdef SS_DEBUG
     dump("PLAIN", plaintext->data, plaintext->len);
     dump("CIPHER", ciphertext->data + nonce_len, ciphertext->len - nonce_len);
     dump("NONCE", ciphertext->data, nonce_len);
 #endif
 
-    stream_ctx_release(&cipher_ctx);
+    ppbloom_add((void *)nonce, nonce_len);
 
     brealloc(ciphertext, plaintext->len, capacity);
     memcpy(ciphertext->data, plaintext->data, plaintext->len);
@@ -476,7 +505,7 @@ int
 stream_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
 {
     if (cipher_ctx == NULL)
-        return -1;
+        return CRYPTO_ERROR;
 
     cipher_t *cipher = cipher_ctx->cipher;
 
@@ -499,7 +528,7 @@ stream_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
                               ciphertext->len);
 
         if (left_len > 0) {
-            memcpy(cipher_ctx->chunk->data, ciphertext->data, left_len);
+            memcpy(cipher_ctx->chunk->data + cipher_ctx->chunk->len, ciphertext->data, left_len);
             memmove(ciphertext->data, ciphertext->data + left_len,
                     ciphertext->len - left_len);
             cipher_ctx->chunk->len += left_len;
@@ -511,7 +540,7 @@ stream_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
 
         uint8_t *nonce   = cipher_ctx->nonce;
         size_t nonce_len = cipher->nonce_len;
-        plaintext->len -= nonce_len;
+        plaintext->len -= left_len;
 
         memcpy(nonce, cipher_ctx->chunk->data, nonce_len);
         cipher_ctx_set_nonce(cipher_ctx, nonce, nonce_len, 0);
@@ -519,12 +548,15 @@ stream_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
         cipher_ctx->init    = 1;
 
         if (cipher->method >= RC4_MD5) {
-            if (cache_key_exist(nonce_cache, (char *)nonce, nonce_len)) {
-                bfree(ciphertext);
-                return -1;
-            } else {
-                cache_insert(nonce_cache, (char *)nonce, nonce_len, NULL);
+            if (ppbloom_check((void *)nonce, nonce_len) == 1) {
+                LOGE("crypto: stream: repeat IV detected");
+                return CRYPTO_ERROR;
             }
+        }
+    } else if (cipher_ctx->init == 1) {
+        if (cipher->method >= RC4_MD5) {
+            ppbloom_add((void *)cipher_ctx->nonce, cipher->nonce_len);
+            cipher_ctx->init = 2;
         }
     }
 
@@ -557,12 +589,10 @@ stream_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
                                 ciphertext->len);
     }
 
-    if (err) {
-        bfree(ciphertext);
+    if (err)
         return CRYPTO_ERROR;
-    }
 
-#ifdef DEBUG
+#ifdef SS_DEBUG
     dump("PLAIN", plaintext->data, plaintext->len);
     dump("CIPHER", ciphertext->data, ciphertext->len);
 #endif
@@ -584,17 +614,6 @@ stream_ctx_init(cipher_t *cipher, cipher_ctx_t *cipher_ctx, int enc)
     if (enc) {
         rand_bytes(cipher_ctx->nonce, cipher->nonce_len);
     }
-}
-
-void
-stream_ctx_release(cipher_ctx_t *cipher_ctx)
-{
-    if (cipher_ctx->cipher->method >= SALSA20) {
-        return;
-    }
-
-    mbedtls_cipher_free(cipher_ctx->evp);
-    ss_free(cipher_ctx->evp);
 }
 
 cipher_t *

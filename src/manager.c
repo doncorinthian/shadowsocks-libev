@@ -84,6 +84,15 @@ setnonblocking(int fd)
 }
 
 static void
+destroy_server(struct server *server) {
+// function used to free memories alloced in **get_server**
+    if (server->method) ss_free(server->method);
+    if (server->plugin) ss_free(server->plugin);
+    if (server->plugin_opts) ss_free(server->plugin_opts);
+    if (server->mode) ss_free(server->mode);
+}
+
+static void
 build_config(char *prefix, struct server *server)
 {
     char *path    = NULL;
@@ -100,9 +109,14 @@ build_config(char *prefix, struct server *server)
         return;
     }
     fprintf(f, "{\n");
-    fprintf(f, "\"server_port\":\"%s\",\n", server->port);
-    fprintf(f, "\"password\":\"%s\",\n", server->password);
-    fprintf(f, "}\n");
+    fprintf(f, "\"server_port\":%d,\n", atoi(server->port));
+    fprintf(f, "\"password\":\"%s\"", server->password);
+    if (server->fast_open[0]) fprintf(f, ",\n\"fast_open\": %s", server->fast_open);
+    if (server->mode)   fprintf(f, ",\n\"mode\":\"%s\"", server->mode);
+    if (server->method) fprintf(f, ",\n\"method\":\"%s\"", server->method);
+    if (server->plugin) fprintf(f, ",\n\"plugin\":\"%s\"", server->plugin);
+    if (server->plugin_opts) fprintf(f, ",\n\"plugin_opts\":\"%s\"", server->plugin_opts);
+    fprintf(f, "\n}\n");
     fclose(f);
     ss_free(path);
 }
@@ -111,14 +125,16 @@ static char *
 construct_command_line(struct manager_ctx *manager, struct server *server)
 {
     static char cmd[BUF_SIZE];
+    char *method = manager->method;
     int i;
 
     build_config(working_dir, server);
 
+    if (server->method) method = server->method;
     memset(cmd, 0, BUF_SIZE);
     snprintf(cmd, BUF_SIZE,
              "%s -m %s --manager-address %s -f %s/.shadowsocks_%s.pid -c %s/.shadowsocks_%s.conf",
-             executable, manager->method, manager->manager_address,
+             executable, method, manager->manager_address,
              working_dir, server->port, working_dir, server->port);
 
     if (manager->acl != NULL) {
@@ -143,19 +159,15 @@ construct_command_line(struct manager_ctx *manager, struct server *server)
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " -v");
     }
-    if (manager->mode == UDP_ONLY) {
+    if (server->mode == NULL && manager->mode == UDP_ONLY) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " -U");
     }
-    if (manager->mode == TCP_AND_UDP) {
+    if (server->mode == NULL && manager->mode == TCP_AND_UDP) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " -u");
     }
-    if (manager->auth) {
-        int len = strlen(cmd);
-        snprintf(cmd + len, BUF_SIZE - len, " -A");
-    }
-    if (manager->fast_open) {
+    if (server->fast_open[0] == 0 && manager->fast_open) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " --fast-open");
     }
@@ -167,11 +179,11 @@ construct_command_line(struct manager_ctx *manager, struct server *server)
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " --mtu %d", manager->mtu);
     }
-    if (manager->plugin) {
+    if (server->plugin == NULL && manager->plugin) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " --plugin \"%s\"", manager->plugin);
     }
-    if (manager->plugin_opts) {
+    if (server->plugin_opts == NULL && manager->plugin_opts) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " --plugin-opts \"%s\"", manager->plugin_opts);
     }
@@ -267,6 +279,26 @@ get_server(char *buf, int len)
             } else if (strcmp(name, "password") == 0) {
                 if (value->type == json_string) {
                     strncpy(server->password, value->u.string.ptr, 128);
+                }
+            } else if (strcmp(name, "method") == 0) {
+                if (value->type == json_string) {
+                    server->method = strdup(value->u.string.ptr);
+                }
+            } else if (strcmp(name, "fast_open") == 0) {
+                if (value->type == json_boolean) {
+                    strncpy(server->fast_open, (value->u.boolean ? "true" : "false"), 8);
+                }
+            } else if (strcmp(name, "plugin") == 0) {
+                if (value->type == json_string) {
+                    server->plugin = strdup(value->u.string.ptr);
+                }
+            } else if (strcmp(name, "plugin_opts") == 0) {
+                if (value->type == json_string) {
+                    server->plugin_opts = strdup(value->u.string.ptr);
+                }
+            } else if (strcmp(name, "mode") == 0) {
+                if (value->type == json_string) {
+                    server->mode = strdup(value->u.string.ptr);
                 }
             } else {
                 LOGE("invalid data: %s", data);
@@ -627,6 +659,7 @@ remove_server(char *prefix, char *port)
     cork_hash_table_delete(server_table, (void *)port, (void **)&old_port, (void **)&old_server);
 
     if (old_server != NULL) {
+        destroy_server(old_server);
         ss_free(old_server);
     }
 
@@ -651,7 +684,7 @@ manager_recv_cb(EV_P_ ev_io *w, int revents)
 {
     struct manager_ctx *manager = (struct manager_ctx *)w;
     socklen_t len;
-    size_t r;
+    ssize_t r;
     struct sockaddr_un claddr;
     char buf[BUF_SIZE];
 
@@ -680,6 +713,7 @@ manager_recv_cb(EV_P_ ev_io *w, int revents)
         if (server == NULL || server->port[0] == 0 || server->password[0] == 0) {
             LOGE("invalid command: %s:%s", buf, get_data(buf, r));
             if (server != NULL) {
+                destroy_server(server);
                 ss_free(server);
             }
             goto ERROR_MSG;
@@ -702,18 +736,53 @@ manager_recv_cb(EV_P_ ev_io *w, int revents)
         if (sendto(manager->fd, msg, msg_len, 0, (struct sockaddr *)&claddr, len) != 2) {
             ERROR("add_sendto");
         }
+    } else if (strcmp(action, "list") == 0) {
+        struct cork_hash_table_iterator  iter;
+        struct cork_hash_table_entry  *entry;
+        char buf[BUF_SIZE];
+        memset(buf, 0, BUF_SIZE);
+        sprintf(buf, "[");
+
+        cork_hash_table_iterator_init(server_table, &iter);
+        while ((entry = cork_hash_table_iterator_next(&iter)) != NULL) {
+            struct server *server = (struct server *)entry->value;
+            char *method = server->method?server->method:manager->method;
+            size_t pos = strlen(buf);
+            size_t entry_len = strlen(server->port) + strlen(server->password) + strlen(method);
+            if (pos > BUF_SIZE-entry_len-50) {
+                if (sendto(manager->fd, buf, pos, 0, (struct sockaddr *)&claddr, len)
+                    != pos) {
+                    ERROR("list_sendto");
+                }
+                memset(buf, 0, BUF_SIZE);
+                pos = 0;
+            }
+            sprintf(buf + pos, "\n\t{\"server_port\":\"%s\",\"password\":\"%s\",\"method\":\"%s\"},", 
+                    server->port,server->password,method);
+
+        }
+
+        size_t pos = strlen(buf);
+        strcpy(buf + pos - 1, "\n]"); //Remove trailing ","
+        pos = strlen(buf);
+        if (sendto(manager->fd, buf, pos, 0, (struct sockaddr *)&claddr, len)
+            != pos) {
+            ERROR("list_sendto");
+        }
     } else if (strcmp(action, "remove") == 0) {
         struct server *server = get_server(buf, r);
 
         if (server == NULL || server->port[0] == 0) {
             LOGE("invalid command: %s:%s", buf, get_data(buf, r));
             if (server != NULL) {
+                destroy_server(server);
                 ss_free(server);
             }
             goto ERROR_MSG;
         }
 
         remove_server(working_dir, server->port);
+        destroy_server(server);
         ss_free(server);
 
         char msg[3] = "ok";
@@ -884,7 +953,6 @@ main(int argc, char **argv)
     char *plugin          = NULL;
     char *plugin_opts     = NULL;
 
-    int auth       = 0;
     int fast_open  = 0;
     int reuse_port = 0;
     int mode       = TCP_ONLY;
@@ -999,14 +1067,14 @@ main(int argc, char **argv)
         case 'h':
             usage();
             exit(EXIT_SUCCESS);
-        case 'A':
-            auth = 1;
-            break;
 #ifdef HAVE_SETRLIMIT
         case 'n':
             nofile = atoi(optarg);
             break;
 #endif
+        case 'A':
+            FATAL("One time auth has been deprecated. Try AEAD ciphers instead.");
+            break;
         case '?':
             // The option character is not recognized.
             LOGE("Unrecognized option: %s", optarg);
@@ -1047,9 +1115,6 @@ main(int argc, char **argv)
         if (conf->nameserver != NULL) {
             nameservers[nameserver_num++] = conf->nameserver;
         }
-        if (auth == 0) {
-            auth = conf->auth;
-        }
         if (mode == TCP_ONLY) {
             mode = conf->mode;
         }
@@ -1089,6 +1154,11 @@ main(int argc, char **argv)
         daemonize(pid_path);
     }
 
+    if (manager_address == NULL) {
+        manager_address = "127.0.0.1:8839";
+        LOGI("using the default manager address: %s", manager_address);
+    }
+
     if (server_num == 0 || manager_address == NULL) {
         usage();
         exit(EXIT_FAILURE);
@@ -1100,10 +1170,6 @@ main(int argc, char **argv)
 #else
         LOGE("tcp fast open is not supported by this environment");
 #endif
-    }
-
-    if (auth) {
-        LOGI("onetime authentication enabled");
     }
 
     // ignore SIGPIPE
@@ -1125,7 +1191,6 @@ main(int argc, char **argv)
     manager.fast_open       = fast_open;
     manager.verbose         = verbose;
     manager.mode            = mode;
-    manager.auth            = auth;
     manager.password        = password;
     manager.timeout         = timeout;
     manager.method          = method;
@@ -1147,11 +1212,6 @@ main(int argc, char **argv)
 
     // initialize ev loop
     struct ev_loop *loop = EV_DEFAULT;
-
-    // setuid
-    if (user != NULL && !run_as(user)) {
-        FATAL("failed to switch user");
-    }
 
     if (geteuid() == 0) {
         LOGI("running from root user");
